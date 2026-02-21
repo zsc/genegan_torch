@@ -12,7 +12,7 @@ from genegan.utils.device import resolve_device
 from genegan.utils.io import load_checkpoint
 
 
-def _load_image(path: str | Path, *, img_size: int = 64) -> torch.Tensor:
+def _load_image(path: str | Path, *, img_size: int) -> torch.Tensor:
     img = load_pil_rgb(path)
     t = CelebAImageTransform(img_size=img_size)(img)
     return t.unsqueeze(0)
@@ -28,7 +28,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("genegan-test")
     p.add_argument("--mode", required=True, choices=["swap", "interpolation", "matrix"])
     p.add_argument("--ckpt", required=True, type=str, help="Checkpoint .pt path")
-    p.add_argument("--device", default=None, choices=["mps", "cuda", "cpu"])
+    p.add_argument("--device", default=None, type=str, help="Device: auto|mps|cpu|cuda|cuda:N")
     p.add_argument("--input", required=True, type=str, help="Source image (to change attribute)")
 
     p.add_argument("--target", type=str, help="Target image (has attribute)")
@@ -49,36 +49,30 @@ def main(argv: list[str] | None = None) -> None:
 
     # reconstruct model (second_ratio from checkpoint config if available)
     ckpt_path = Path(args.ckpt)
-    tmp_model = GeneGAN(second_ratio=0.25)
-    ckpt = load_checkpoint(
+    ckpt_raw = torch.load(str(ckpt_path), map_location="cpu")
+    cfg = ckpt_raw.get("config", {}) or {}
+    second_ratio = float(cfg.get("second_ratio", 0.25))
+    img_size = int(cfg.get("img_size", 64))
+
+    model = GeneGAN(second_ratio=second_ratio, img_size=img_size)
+    load_checkpoint(
         ckpt_path,
-        splitter=tmp_model.splitter,
-        joiner=tmp_model.joiner,
-        d_ax=tmp_model.d_ax,
-        d_be=tmp_model.d_be,
+        splitter=model.splitter,
+        joiner=model.joiner,
+        d_ax=model.d_ax,
+        d_be=model.d_be,
         map_location="cpu",
     )
-    second_ratio = float(ckpt.get("config", {}).get("second_ratio", 0.25))
-    model = tmp_model if second_ratio == 0.25 else GeneGAN(second_ratio=second_ratio)
-    if model is not tmp_model:
-        load_checkpoint(
-            ckpt_path,
-            splitter=model.splitter,
-            joiner=model.joiner,
-            d_ax=model.d_ax,
-            d_be=model.d_be,
-            map_location="cpu",
-        )
 
     model.to(device=device, dtype=torch.float32)
     model.eval()
 
-    src = _load_image(args.input).to(device=device, dtype=torch.float32)
+    src = _load_image(args.input, img_size=img_size).to(device=device, dtype=torch.float32)
 
     if args.mode == "swap":
         if not args.target:
             raise SystemExit("--target is required for swap mode")
-        att = _load_image(args.target).to(device=device, dtype=torch.float32)
+        att = _load_image(args.target, img_size=img_size).to(device=device, dtype=torch.float32)
         with torch.no_grad():
             A, x = model.splitter(att)
             B, _ = model.splitter(src)
@@ -95,7 +89,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.mode == "interpolation":
         if not args.target:
             raise SystemExit("--target is required for interpolation mode")
-        att = _load_image(args.target).to(device=device, dtype=torch.float32)
+        att = _load_image(args.target, img_size=img_size).to(device=device, dtype=torch.float32)
         from PIL import Image
 
         with torch.no_grad():
@@ -119,7 +113,9 @@ def main(argv: list[str] | None = None) -> None:
         if m < 2 or n < 2:
             raise SystemExit("--size must be at least 2 2")
 
-        att_imgs = torch.cat([_load_image(p) for p in args.targets], dim=0).to(
+        att_imgs = torch.cat(
+            [_load_image(p, img_size=img_size) for p in args.targets], dim=0
+        ).to(
             device=device, dtype=torch.float32
         )
 
@@ -141,7 +137,7 @@ def main(argv: list[str] | None = None) -> None:
                         [row[0] * col[0], row[0] * col[1], row[1] * col[0], row[1] * col[1]]
                     )
 
-            h = w = 64
+            h = w = img_size
             out = np.zeros((0, w * n, 3), dtype=np.uint8)
             cnt = 0
             for _i in range(m):

@@ -64,9 +64,9 @@ class TrainConfig:
     max_images_per_split: int | None = None
     resume_ckpt: str | None = None
 
-    max_iter: int = 100000
+    max_iter: int = 300000
     batch_size: int = 64
-    img_size: int = 64
+    img_size: int = 128
     g_lr: float = 5e-5
     d_lr: float = 5e-5
     second_ratio: float = 0.25
@@ -77,6 +77,7 @@ class TrainConfig:
     critic_n_500: int = 100
 
     save_every: int = 500
+    sample_every: int = 500
     log_every: int = 20
 
 
@@ -94,6 +95,12 @@ def train(cfg: TrainConfig) -> None:
     sample_dir = ensure_dir(exp_dir / "samples")
     log_dir = ensure_dir(exp_dir / "logs")
 
+    device_spec = resolve_device(cfg.device)
+    device = device_spec.device
+    use_cuda = device_spec.type == "cuda"
+    if use_cuda:
+        torch.backends.cudnn.benchmark = True
+
     split = build_celeba_attribute_datasets(
         data_root=cfg.data_root,
         attribute=cfg.attribute,
@@ -109,6 +116,7 @@ def train(cfg: TrainConfig) -> None:
         shuffle=True,
         num_workers=cfg.num_workers,
         seed=cfg.seed + 1,
+        pin_memory=use_cuda,
     )
     dl_b = make_dataloader(
         split.without_attr,
@@ -116,15 +124,15 @@ def train(cfg: TrainConfig) -> None:
         shuffle=True,
         num_workers=cfg.num_workers,
         seed=cfg.seed + 2,
+        pin_memory=use_cuda,
     )
 
     it_a = _infinite(dl_a)
     it_b = _infinite(dl_b)
 
-    model = GeneGAN(second_ratio=cfg.second_ratio)
+    model = GeneGAN(second_ratio=cfg.second_ratio, img_size=cfg.img_size)
     model.apply(init_weights_normal_02)
 
-    device = resolve_device(cfg.device).device
     model.to(device=device, dtype=torch.float32)
     model.train()
 
@@ -166,137 +174,165 @@ def train(cfg: TrainConfig) -> None:
     last_d = None
 
     pbar = tqdm(range(start_iter, cfg.max_iter), desc="train", dynamic_ncols=True)
-    for i in pbar:
-        d_num = cfg.critic_n_500 if i % cfg.critic_every == 0 else cfg.critic_n
+    last_iter: int | None = None
 
-        # update D (with clipping)
-        for _ in range(d_num):
-            Au = next(it_a).to(device=device, dtype=torch.float32)
-            B0 = next(it_b).to(device=device, dtype=torch.float32)
+    def _save_ckpt(iteration: int) -> None:
+        ckpt_path = ckpt_dir / f"iter_{iteration:06d}.pt"
+        save_checkpoint(
+            ckpt_path,
+            splitter=model.splitter,
+            joiner=model.joiner,
+            d_ax=model.d_ax,
+            d_be=model.d_be,
+            opt_g=opt_g,
+            opt_d=opt_d,
+            iteration=iteration,
+            config=asdict(cfg),
+        )
+        save_checkpoint(
+            ckpt_dir / "latest.pt",
+            splitter=model.splitter,
+            joiner=model.joiner,
+            d_ax=model.d_ax,
+            d_be=model.d_be,
+            opt_g=opt_g,
+            opt_d=opt_d,
+            iteration=iteration,
+            config=asdict(cfg),
+        )
 
-            opt_d.zero_grad(set_to_none=True)
-            with torch.no_grad():
+    def _save_samples(iteration: int) -> None:
+        # sample images: keep BN in train-mode, but avoid updating running stats
+        with _bn_momentum(model, 0.0), torch.no_grad():
+            Au_s = next(it_a).to(device=device, dtype=torch.float32, non_blocking=use_cuda)
+            B0_s = next(it_b).to(device=device, dtype=torch.float32, non_blocking=use_cuda)
+            outs_s = model(Au_s, B0_s)
+
+            n = min(5, Au_s.shape[0])
+            for j in range(n):
+                save_concat_row(
+                    [
+                        Au_s[j],
+                        B0_s[j],
+                        outs_s.A0[j],
+                        outs_s.Bu[j],
+                        outs_s.Au_hat[j],
+                        outs_s.B0_hat[j],
+                    ],
+                    sample_dir / f"iter_{iteration:06d}_{j}.jpg",
+                )
+
+    interrupted = False
+    try:
+        for i in pbar:
+            last_iter = i
+            d_num = cfg.critic_n_500 if i % cfg.critic_every == 0 else cfg.critic_n
+
+            # update D (with clipping)
+            for _ in range(d_num):
+                Au = next(it_a).to(
+                    device=device, dtype=torch.float32, non_blocking=use_cuda
+                )
+                B0 = next(it_b).to(
+                    device=device, dtype=torch.float32, non_blocking=use_cuda
+                )
+
+                opt_d.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    outs = model(Au, B0)
+                d_losses = compute_d_losses(
+                    Au=Au,
+                    B0=B0,
+                    A0=outs.A0,
+                    Bu=outs.Bu,
+                    d_ax=model.d_ax,
+                    d_be=model.d_be,
+                )
+                d_losses.loss_D.backward()
+                opt_d.step()
+                clip_params_(model.d_ax, cfg.critic_clip)
+                clip_params_(model.d_be, cfg.critic_clip)
+                last_d = d_losses
+
+            # update G
+            Au = next(it_a).to(
+                device=device, dtype=torch.float32, non_blocking=use_cuda
+            )
+            B0 = next(it_b).to(
+                device=device, dtype=torch.float32, non_blocking=use_cuda
+            )
+
+            _set_requires_grad(model.d_ax, False)
+            _set_requires_grad(model.d_be, False)
+            try:
+                opt_g.zero_grad(set_to_none=True)
                 outs = model(Au, B0)
-            d_losses = compute_d_losses(
-                Au=Au,
-                B0=B0,
-                A0=outs.A0,
-                Bu=outs.Bu,
-                d_ax=model.d_ax,
-                d_be=model.d_be,
-            )
-            d_losses.loss_D.backward()
-            opt_d.step()
-            clip_params_(model.d_ax, cfg.critic_clip)
-            clip_params_(model.d_be, cfg.critic_clip)
-            last_d = d_losses
+                g_losses = compute_g_losses(
+                    Au=Au,
+                    B0=B0,
+                    A0=outs.A0,
+                    Bu=outs.Bu,
+                    Au_hat=outs.Au_hat,
+                    B0_hat=outs.B0_hat,
+                    e=outs.e,
+                    d_ax=model.d_ax,
+                    d_be=model.d_be,
+                    splitter=model.splitter,
+                    joiner=model.joiner,
+                    weight_decay=cfg.weight_decay,
+                )
+                g_losses.loss_G.backward()
+                opt_g.step()
+                last_g = g_losses
+            finally:
+                _set_requires_grad(model.d_ax, True)
+                _set_requires_grad(model.d_be, True)
 
-        # update G
-        Au = next(it_a).to(device=device, dtype=torch.float32)
-        B0 = next(it_b).to(device=device, dtype=torch.float32)
+            if last_g is not None and last_d is not None:
+                pbar.set_postfix(
+                    g=float(last_g.loss_G.detach().cpu()),
+                    d=float(last_d.loss_D.detach().cpu()),
+                )
 
-        _set_requires_grad(model.d_ax, False)
-        _set_requires_grad(model.d_be, False)
-        try:
-            opt_g.zero_grad(set_to_none=True)
-            outs = model(Au, B0)
-            g_losses = compute_g_losses(
-                Au=Au,
-                B0=B0,
-                A0=outs.A0,
-                Bu=outs.Bu,
-                Au_hat=outs.Au_hat,
-                B0_hat=outs.B0_hat,
-                e=outs.e,
-                d_ax=model.d_ax,
-                d_be=model.d_be,
-                splitter=model.splitter,
-                joiner=model.joiner,
-                weight_decay=cfg.weight_decay,
-            )
-            g_losses.loss_G.backward()
-            opt_g.step()
-            last_g = g_losses
-        finally:
-            _set_requires_grad(model.d_ax, True)
-            _set_requires_grad(model.d_be, True)
+            if i % cfg.log_every == 0 and last_g is not None and last_d is not None:
+                # G losses
+                writer.add_scalar("e", float(last_g.e.detach().cpu()), i)
+                writer.add_scalar("cycle_Ax", float(last_g.cycle_Ax.detach().cpu()), i)
+                writer.add_scalar("cycle_Be", float(last_g.cycle_Be.detach().cpu()), i)
+                writer.add_scalar("Bx", float(last_g.Bx.detach().cpu()), i)
+                writer.add_scalar("Ae", float(last_g.Ae.detach().cpu()), i)
+                writer.add_scalar(
+                    "parallelogram", float(last_g.parallelogram.detach().cpu()), i
+                )
+                writer.add_scalar(
+                    "loss_G_nodecay", float(last_g.loss_G_nodecay.detach().cpu()), i
+                )
+                writer.add_scalar(
+                    "loss_G_decay", float(last_g.loss_G_decay.detach().cpu()), i
+                )
+                writer.add_scalar("loss_G", float(last_g.loss_G.detach().cpu()), i)
 
-        if last_g is not None and last_d is not None:
-            pbar.set_postfix(
-                g=float(last_g.loss_G.detach().cpu()),
-                d=float(last_d.loss_D.detach().cpu()),
-            )
+                # D losses
+                writer.add_scalar("Ax_Bx", float(last_d.Ax_Bx.detach().cpu()), i)
+                writer.add_scalar("Be_Ae", float(last_d.Be_Ae.detach().cpu()), i)
+                writer.add_scalar("loss_D", float(last_d.loss_D.detach().cpu()), i)
 
-        if i % cfg.log_every == 0 and last_g is not None and last_d is not None:
-            # G losses
-            writer.add_scalar("e", float(last_g.e.detach().cpu()), i)
-            writer.add_scalar("cycle_Ax", float(last_g.cycle_Ax.detach().cpu()), i)
-            writer.add_scalar("cycle_Be", float(last_g.cycle_Be.detach().cpu()), i)
-            writer.add_scalar("Bx", float(last_g.Bx.detach().cpu()), i)
-            writer.add_scalar("Ae", float(last_g.Ae.detach().cpu()), i)
-            writer.add_scalar(
-                "parallelogram", float(last_g.parallelogram.detach().cpu()), i
-            )
-            writer.add_scalar(
-                "loss_G_nodecay", float(last_g.loss_G_nodecay.detach().cpu()), i
-            )
-            writer.add_scalar(
-                "loss_G_decay", float(last_g.loss_G_decay.detach().cpu()), i
-            )
-            writer.add_scalar("loss_G", float(last_g.loss_G.detach().cpu()), i)
+                # learning rate
+                writer.add_scalar("g_learning_rate", cfg.g_lr, i)
+                writer.add_scalar("d_learning_rate", cfg.d_lr, i)
 
-            # D losses
-            writer.add_scalar("Ax_Bx", float(last_d.Ax_Bx.detach().cpu()), i)
-            writer.add_scalar("Be_Ae", float(last_d.Be_Ae.detach().cpu()), i)
-            writer.add_scalar("loss_D", float(last_d.loss_D.detach().cpu()), i)
+            if i % cfg.save_every == 0:
+                _save_ckpt(i)
+            if i % cfg.sample_every == 0:
+                _save_samples(i)
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        writer.close()
+        if last_iter is not None and (interrupted or last_iter % cfg.save_every != 0):
+            _save_ckpt(last_iter)
+        if last_iter is not None and (interrupted or last_iter % cfg.sample_every != 0):
+            _save_samples(last_iter)
 
-            # learning rate
-            writer.add_scalar("g_learning_rate", cfg.g_lr, i)
-            writer.add_scalar("d_learning_rate", cfg.d_lr, i)
-
-        if i % cfg.save_every == 0:
-            ckpt_path = ckpt_dir / f"iter_{i:06d}.pt"
-            save_checkpoint(
-                ckpt_path,
-                splitter=model.splitter,
-                joiner=model.joiner,
-                d_ax=model.d_ax,
-                d_be=model.d_be,
-                opt_g=opt_g,
-                opt_d=opt_d,
-                iteration=i,
-                config=asdict(cfg),
-            )
-            save_checkpoint(
-                ckpt_dir / "latest.pt",
-                splitter=model.splitter,
-                joiner=model.joiner,
-                d_ax=model.d_ax,
-                d_be=model.d_be,
-                opt_g=opt_g,
-                opt_d=opt_d,
-                iteration=i,
-                config=asdict(cfg),
-            )
-
-            # sample images: keep BN in train-mode, but avoid updating running stats
-            with _bn_momentum(model, 0.0), torch.no_grad():
-                Au_s = next(it_a).to(device=device, dtype=torch.float32)
-                B0_s = next(it_b).to(device=device, dtype=torch.float32)
-                outs_s = model(Au_s, B0_s)
-
-                n = min(5, Au_s.shape[0])
-                for j in range(n):
-                    save_concat_row(
-                        [
-                            Au_s[j],
-                            B0_s[j],
-                            outs_s.A0[j],
-                            outs_s.Bu[j],
-                            outs_s.Au_hat[j],
-                            outs_s.B0_hat[j],
-                        ],
-                        sample_dir / f"iter_{i:06d}_{j}.jpg",
-                    )
-
-    writer.close()
+        if interrupted:  # pragma: no cover
+            raise KeyboardInterrupt

@@ -145,7 +145,7 @@ def build_celeba_attribute_datasets(
     attribute: str,
     image_dir: str | Path | None = None,
     attr_file: str | Path | None = None,
-    img_size: int = 64,
+    img_size: int = 128,
     max_images_per_split: int | None = None,
 ) -> CelebASplitDatasets:
     root = Path(data_root)
@@ -198,17 +198,20 @@ def make_dataloader(
     shuffle: bool,
     num_workers: int,
     seed: int,
+    pin_memory: bool = False,
 ) -> DataLoader[torch.Tensor]:
     generator = torch.Generator()
     generator.manual_seed(seed)
 
+    persistent_workers = num_workers > 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=True,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=pin_memory,
         generator=generator,
         worker_init_fn=seed_worker if num_workers > 0 else None,
+        persistent_workers=persistent_workers,
     )

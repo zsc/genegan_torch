@@ -15,8 +15,8 @@ class TestForward(unittest.TestCase):
         model.train()
 
         b = 2
-        Au = torch.rand(b, 3, 64, 64, dtype=torch.float32) * 255.0
-        B0 = torch.rand(b, 3, 64, 64, dtype=torch.float32) * 255.0
+        Au = torch.rand(b, 3, 128, 128, dtype=torch.float32) * 255.0
+        B0 = torch.rand(b, 3, 128, 128, dtype=torch.float32) * 255.0
 
         outs = model(Au, B0)
         self.assertTrue(torch.isfinite(outs.Au_hat).all().item())
@@ -51,4 +51,3 @@ class TestForward(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

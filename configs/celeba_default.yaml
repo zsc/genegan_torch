@@ -1,8 +1,8 @@
 dataset:
-  img_size: 64
+  img_size: 128
 train:
   batch_size: 64
-  max_iter: 100000
+  max_iter: 300000
   g_lr: 5.0e-5
   d_lr: 5.0e-5
   second_ratio: 0.25

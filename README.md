@@ -57,6 +57,20 @@ python -m genegan.cli.train \
   --device mps
 ```
 
+默认训练/推理分辨率为 `128×128`（`--img_size 128`），并相应扩展了网络结构；如需使用原始 `64×64` 版本，传 `--img_size 64` 即可。
+
+CUDA（Linux/Windows）：
+
+```bash
+python -m genegan.cli.train \
+  --attribute Bangs \
+  --data_root img_align_celeba \
+  --exp_dir outputs/celebA_Bangs_cuda \
+  --device cuda
+```
+
+> 备注：为了避免 GPU 训练过快导致 checkpoint 占满磁盘，CUDA 下默认 `--save_every=20000`、`--sample_every=5000`。如需严格对齐官方 TF 的保存频率，可显式设回 `--save_every 500 --sample_every 500`。
+
 ## 推理 demo
 
 Swap / interpolation / matrix：
