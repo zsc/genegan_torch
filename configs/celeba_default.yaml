@@ -1,0 +1,15 @@
+dataset:
+  img_size: 64
+train:
+  batch_size: 64
+  max_iter: 100000
+  g_lr: 5.0e-5
+  d_lr: 5.0e-5
+  second_ratio: 0.25
+  weight_decay: 5.0e-5
+  critic_clip: 0.01
+  critic_every: 500
+  critic_n: 1
+  critic_n_500: 100
+  save_every: 500
+  log_every: 50
