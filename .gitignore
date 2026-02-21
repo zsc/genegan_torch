@@ -55,7 +55,6 @@ runs/
 
 # Datasets (large files)
 datasets/
-data/
 *.zip
 *.tar
 *.tar.gz
