@@ -71,6 +71,24 @@ python -m genegan.cli.train \
 
 > 备注：为了避免 GPU 训练过快导致 checkpoint 占满磁盘，CUDA 下默认 `--save_every=20000`、`--sample_every=5000`。如需严格对齐官方 TF 的保存频率，可显式设回 `--save_every 500 --sample_every 500`。
 
+## 当前实验结果（定性）
+
+我们在 CelebA（`img_align_celeba/`）上做了一个 multi-res（64/96/128）共享主干 + SwitchableBN 的版本（WGAN + weight clipping）。
+
+- **EXP00 / Smiling / 64+96+128 混训**：训到 ~31k iter 时，重建（`Au_hat`/`B0_hat`）已经比较稳定；`Bu`（给 B0 加 smile）通常自然；`A0`（从 Au 去 smile）偶尔会出现肤色/色调漂移（还在继续排查/对比实验）。
+- 其它实验队列与运行方式见 `queue.md`。
+
+样例（iter=31318，列顺序：`Au | B0 | A0 | Bu | Au_hat | B0_hat`；用 `kimi -p` 按“笑/不笑/重建像/无漂移”约束挑选）：
+
+![EXP00 Smiling multi-res sample](assets/exp00_smiling_iter31318_row3.jpg)
+
+FID（128x128，N=5000，batch=8）：
+
+| checkpoint iter | FID(Bu -> with_attr) | FID(A0 -> without_attr) |
+|---:|---:|---:|
+| 20000 | 34.68 | 33.74 |
+| 31318 | 16.22 | 13.87 |
+
 ## 推理 demo
 
 Swap / interpolation / matrix：
@@ -78,6 +96,43 @@ Swap / interpolation / matrix：
 ```bash
 python -m genegan.cli.test --help
 ```
+
+## 评估：FID（可选）
+
+本仓库提供一个简单的 FID 评估脚本（对 CelebA 的 attribute 两个 split）：
+
+```bash
+python scripts/eval_fid.py \
+  --ckpt outputs/<exp>/checkpoints/latest.pt \
+  --attribute Smiling \
+  --data_root img_align_celeba \
+  --img_size 128 \
+  --n 5000 \
+  --batch_size 8 \
+  --num_workers 4 \
+  --device cuda \
+  --out outputs/<exp>/fid_128_n5000.json
+```
+
+输出包含两项：
+- `fid_Bu_vs_with_attr`：把属性从 `Au` 移植到 `B0` 生成的 `Bu`，与真实 `with_attr` 分布的 FID
+- `fid_A0_vs_without_attr`：从 `Au` 去属性生成的 `A0`，与真实 `without_attr` 分布的 FID
+
+## VQVAE 初始化（可选）
+
+如果你已有一个训练好的 VQVAE checkpoint，可用它初始化 GeneGAN 的生成器（splitter/joiner）：
+
+```bash
+python -m genegan.cli.train \
+  --attribute Smiling \
+  --data_root img_align_celeba \
+  --exp_dir outputs/exp_vqinit \
+  --device cuda \
+  --init_vqvae_ckpt /path/to/vqvae.pt
+```
+
+如 VQVAE 的 key 命名不匹配，可额外提供显式 mapping：
+`--init_vqvae_map mapping.json`（key 必须以 `splitter.` / `joiner.` 开头）。
 
 ## 备注：论文 vs 官方 TF 复现
 

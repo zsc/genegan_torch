@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> None:
     second_ratio = float(cfg.get("second_ratio", 0.25))
     img_size = int(cfg.get("img_size", 64))
 
-    model = GeneGAN(second_ratio=second_ratio, img_size=img_size)
+    model = GeneGAN(second_ratio=second_ratio)
     load_checkpoint(
         ckpt_path,
         splitter=model.splitter,
@@ -77,8 +77,8 @@ def main(argv: list[str] | None = None) -> None:
             A, x = model.splitter(att)
             B, _ = model.splitter(src)
             zeros = torch.zeros_like(x)
-            out1 = model.joiner(B, x)  # src with attribute
-            out2 = model.joiner(A, zeros)  # target without attribute
+            out1 = model.joiner(B, x, out_size=img_size)  # src with attribute
+            out2 = model.joiner(A, zeros, out_size=img_size)  # target without attribute
 
         from PIL import Image
 
@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> None:
             outs = [_to_uint8_hwc(src)]
             for i in range(1, args.num + 1):
                 lam = i / float(args.num)
-                out_i = model.joiner(B, x * lam)
+                out_i = model.joiner(B, x * lam, out_size=img_size)
                 outs.append(_to_uint8_hwc(out_i))
 
         canvas = np.concatenate(outs, axis=1)
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> None:
                 for _j in range(n):
                     four = four_tuple[cnt]
                     attribute = sum(four[k] * attrs[k] for k in range(4))
-                    img = model.joiner(B, attribute)
+                    img = model.joiner(B, attribute, out_size=img_size)
                     out_row = np.concatenate((out_row, _to_uint8_hwc(img)), axis=1)
                     cnt += 1
                 out = np.concatenate((out, out_row), axis=0)

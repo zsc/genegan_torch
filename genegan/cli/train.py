@@ -36,10 +36,41 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--max_iter", default=300000, type=int)
     p.add_argument("--batch_size", default=64, type=int)
     p.add_argument("--img_size", default=128, type=int)
+    p.add_argument(
+        "--img_sizes",
+        nargs="+",
+        default=None,
+        type=int,
+        help="Train with multiple resolutions, e.g. --img_sizes 64 96 128. "
+        "If set, --img_size is still used for sampling/visualization size.",
+    )
 
     p.add_argument("--g_lr", default=5e-5, type=float)
     p.add_argument("--d_lr", default=5e-5, type=float)
     p.add_argument("--second_ratio", default=0.25, type=float)
+    p.add_argument(
+        "--obj_blockconv",
+        action="store_true",
+        help="Enable spatial block-wise conv on the object subspace at the bottleneck (EXP01).",
+    )
+    p.add_argument(
+        "--obj_block_size",
+        default=4,
+        type=int,
+        help="Block size for --obj_blockconv. Must divide bottleneck size (12 and 16).",
+    )
+    p.add_argument(
+        "--init_vqvae_ckpt",
+        default=None,
+        type=str,
+        help="Optional VQVAE checkpoint path to initialize G (splitter/joiner).",
+    )
+    p.add_argument(
+        "--init_vqvae_map",
+        default=None,
+        type=str,
+        help="Optional JSON mapping for VQVAE init (keys: splitter.* / joiner.*).",
+    )
     p.add_argument("--weight_decay", default=5e-5, type=float)
     p.add_argument("--critic_clip", default=0.01, type=float)
     p.add_argument("--critic_every", default=500, type=int)
@@ -99,9 +130,14 @@ def main(argv: list[str] | None = None) -> None:
         max_iter=args.max_iter,
         batch_size=args.batch_size,
         img_size=args.img_size,
+        img_sizes=tuple(args.img_sizes) if args.img_sizes is not None else None,
         g_lr=args.g_lr,
         d_lr=args.d_lr,
         second_ratio=args.second_ratio,
+        obj_blockconv=bool(args.obj_blockconv),
+        obj_block_size=int(args.obj_block_size),
+        init_vqvae_ckpt=args.init_vqvae_ckpt,
+        init_vqvae_map=args.init_vqvae_map,
         weight_decay=args.weight_decay,
         critic_clip=args.critic_clip,
         critic_every=args.critic_every,

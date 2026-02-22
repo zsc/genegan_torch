@@ -52,6 +52,32 @@ This file captures “gotchas” and working command lines discovered while impl
 - Use `--resume_ckpt outputs/<exp>/checkpoints/latest.pt` to continue training.
   - Loads model + optim state; continues from `iter + 1`.
 
+## FID Evaluation (CelebA attribute splits)
+
+- We compute two FIDs at a fixed resolution (default: **128x128**) to compare experiments:
+  - `FID(Bu -> with_attr)` and `FID(A0 -> without_attr)`
+- Command template:
+
+```bash
+python scripts/eval_fid.py \
+  --ckpt outputs/<exp>/checkpoints/latest.pt \
+  --attribute Smiling \
+  --data_root img_align_celeba \
+  --img_size 128 \
+  --n 5000 \
+  --batch_size 8 \
+  --num_workers 4 \
+  --device cuda \
+  --out outputs/<exp>/fid_128_n5000.json
+```
+
+## VQVAE Init (Optional)
+
+- Warm-start generator from a pretrained VQVAE checkpoint:
+  - `--init_vqvae_ckpt /path/to/vqvae.pt`
+  - Optional explicit mapping (JSON) if key names don't match: `--init_vqvae_map mapping.json`
+    - Keys must be prefixed with `splitter.` or `joiner.` (e.g. `splitter.conv1.weight`).
+
 ## Working command templates
 
 ### Short smoke run (minutes)
@@ -86,4 +112,3 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python -m genegan.cli.train \
 ```bash
 tensorboard --logdir outputs/<exp>/logs
 ```
-

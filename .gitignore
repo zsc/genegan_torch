@@ -63,5 +63,9 @@ datasets/
 *.jpg
 *.png
 *.jpeg
+
+# Allow a few curated images for documentation.
+!assets/
+!assets/**/*
 # TensorBoard
 events.out.tfevents.*

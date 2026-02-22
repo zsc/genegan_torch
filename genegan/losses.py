@@ -31,14 +31,43 @@ def generator_weight_decay(
     splitter: nn.Module,
     joiner: nn.Module,
     weight_decay: float,
+    img_size: int | None = None,
 ) -> torch.Tensor:
     if weight_decay <= 0:
         return torch.tensor(0.0, device=next(splitter.parameters()).device)
 
     weights: list[torch.Tensor] = []
-    for m in list(splitter.modules()) + list(joiner.modules()):
-        if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+
+    # For the multi-res model we share most weights. To match single-resolution
+    # behavior, we can optionally exclude blocks that are inactive for the given
+    # resolution (e.g. extra down/up block for 96/128).
+    if img_size in {64, 96, 128}:
+        # Splitter
+        for name in ("conv1", "conv2", "conv3"):
+            m = getattr(splitter, name, None)
+            if isinstance(m, nn.Conv2d):
+                weights.append(m.weight)
+        if img_size in {96, 128}:
+            m = getattr(splitter, "conv4", None)
+            if isinstance(m, nn.Conv2d):
+                weights.append(m.weight)
+
+        # Joiner
+        for name in ("deconv1", "deconv2"):
+            m = getattr(joiner, name, None)
+            if isinstance(m, nn.ConvTranspose2d):
+                weights.append(m.weight)
+        if img_size in {96, 128}:
+            m = getattr(joiner, "deconv3", None)
+            if isinstance(m, nn.ConvTranspose2d):
+                weights.append(m.weight)
+        m = getattr(joiner, "to_rgb", None)
+        if isinstance(m, nn.Conv2d):
             weights.append(m.weight)
+    else:
+        for m in list(splitter.modules()) + list(joiner.modules()):
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+                weights.append(m.weight)
 
     if not weights:
         return torch.tensor(0.0, device=next(splitter.parameters()).device)
@@ -81,7 +110,10 @@ def compute_g_losses(
     )
 
     loss_decay = generator_weight_decay(
-        splitter=splitter, joiner=joiner, weight_decay=weight_decay
+        splitter=splitter,
+        joiner=joiner,
+        weight_decay=weight_decay,
+        img_size=int(Au.shape[-1]),
     )
     loss_total = loss_nodecay + loss_decay
 
@@ -111,4 +143,3 @@ def compute_d_losses(
     loss_be = (d_be(A0) - d_be(B0)).mean()
     loss_total = loss_ax + loss_be
     return DLosses(Ax_Bx=loss_ax, Be_Ae=loss_be, loss_D=loss_total)
-

@@ -14,7 +14,13 @@ from genegan.losses import GLosses, compute_d_losses, compute_g_losses
 from genegan.models.genegan import GeneGAN
 from genegan.models.init import clip_params_, init_weights_normal_02
 from genegan.utils.device import resolve_device
-from genegan.utils.io import ensure_dir, load_checkpoint, save_checkpoint, save_concat_row
+from genegan.utils.io import (
+    ensure_dir,
+    load_checkpoint,
+    point_latest_checkpoint,
+    save_checkpoint,
+    save_concat_row,
+)
 from genegan.utils.seed import set_seed
 
 
@@ -67,9 +73,14 @@ class TrainConfig:
     max_iter: int = 300000
     batch_size: int = 64
     img_size: int = 128
+    img_sizes: tuple[int, ...] | None = None
     g_lr: float = 5e-5
     d_lr: float = 5e-5
     second_ratio: float = 0.25
+    obj_blockconv: bool = False
+    obj_block_size: int = 4
+    init_vqvae_ckpt: str | None = None
+    init_vqvae_map: str | None = None
     weight_decay: float = 5e-5
     critic_clip: float = 0.01
     critic_every: int = 500
@@ -101,37 +112,67 @@ def train(cfg: TrainConfig) -> None:
     if use_cuda:
         torch.backends.cudnn.benchmark = True
 
-    split = build_celeba_attribute_datasets(
-        data_root=cfg.data_root,
-        attribute=cfg.attribute,
-        image_dir=cfg.image_dir,
-        attr_file=cfg.attr_file,
-        img_size=cfg.img_size,
-        max_images_per_split=cfg.max_images_per_split,
-    )
+    train_sizes = tuple(int(s) for s in (cfg.img_sizes or (cfg.img_size,)))
+    if not train_sizes:
+        raise ValueError("img_sizes must be non-empty")
+    allowed = {64, 96, 128}
+    bad = [s for s in train_sizes if s not in allowed]
+    if bad:
+        raise ValueError(f"Unsupported img_sizes: {bad}. Supported: {sorted(allowed)}")
 
-    dl_a = make_dataloader(
-        split.with_attr,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        seed=cfg.seed + 1,
-        pin_memory=use_cuda,
-    )
-    dl_b = make_dataloader(
-        split.without_attr,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        seed=cfg.seed + 2,
-        pin_memory=use_cuda,
-    )
+    # Per-resolution data pipelines.
+    it_a: dict[int, Iterator[torch.Tensor]] = {}
+    it_b: dict[int, Iterator[torch.Tensor]] = {}
+    for s in train_sizes:
+        split_s = build_celeba_attribute_datasets(
+            data_root=cfg.data_root,
+            attribute=cfg.attribute,
+            image_dir=cfg.image_dir,
+            attr_file=cfg.attr_file,
+            img_size=s,
+            max_images_per_split=cfg.max_images_per_split,
+        )
+        dl_a_s = make_dataloader(
+            split_s.with_attr,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            seed=cfg.seed + 1000 + s,
+            pin_memory=use_cuda,
+        )
+        dl_b_s = make_dataloader(
+            split_s.without_attr,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            seed=cfg.seed + 2000 + s,
+            pin_memory=use_cuda,
+        )
+        it_a[s] = _infinite(dl_a_s)
+        it_b[s] = _infinite(dl_b_s)
 
-    it_a = _infinite(dl_a)
-    it_b = _infinite(dl_b)
+    sample_size = int(cfg.img_size)
+    if sample_size not in it_a:
+        sample_size = max(train_sizes)
 
-    model = GeneGAN(second_ratio=cfg.second_ratio, img_size=cfg.img_size)
+    model = GeneGAN(
+        second_ratio=cfg.second_ratio,
+        obj_blockconv=bool(cfg.obj_blockconv),
+        obj_block_size=int(cfg.obj_block_size),
+    )
     model.apply(init_weights_normal_02)
+    if cfg.init_vqvae_ckpt is not None:
+        from genegan.utils.vq_init import init_genegan_generator_from_vqvae
+
+        rep = init_genegan_generator_from_vqvae(
+            splitter=model.splitter,
+            joiner=model.joiner,
+            vqvae_ckpt=cfg.init_vqvae_ckpt,
+            mapping_json=cfg.init_vqvae_map,
+        )
+        print(
+            f"[vq-init] loaded={len(rep.loaded)} ambiguous={len(rep.ambiguous)} missing={len(rep.missing)}"
+        )
 
     model.to(device=device, dtype=torch.float32)
     model.train()
@@ -189,23 +230,22 @@ def train(cfg: TrainConfig) -> None:
             iteration=iteration,
             config=asdict(cfg),
         )
-        save_checkpoint(
-            ckpt_dir / "latest.pt",
-            splitter=model.splitter,
-            joiner=model.joiner,
-            d_ax=model.d_ax,
-            d_be=model.d_be,
-            opt_g=opt_g,
-            opt_d=opt_d,
-            iteration=iteration,
-            config=asdict(cfg),
-        )
+        point_latest_checkpoint(ckpt_dir / "latest.pt", ckpt_path)
 
     def _save_samples(iteration: int) -> None:
         # sample images: keep BN in train-mode, but avoid updating running stats
         with _bn_momentum(model, 0.0), torch.no_grad():
-            Au_s = next(it_a).to(device=device, dtype=torch.float32, non_blocking=use_cuda)
-            B0_s = next(it_b).to(device=device, dtype=torch.float32, non_blocking=use_cuda)
+            try:
+                Au_s = next(it_a[sample_size]).to(
+                    device=device, dtype=torch.float32, non_blocking=use_cuda
+                )
+                B0_s = next(it_b[sample_size]).to(
+                    device=device, dtype=torch.float32, non_blocking=use_cuda
+                )
+            except (StopIteration, RuntimeError):
+                # When shutting down (e.g. Ctrl+C), DataLoader workers may already be
+                # stopped; avoid crashing while trying to write final samples.
+                return
             outs_s = model(Au_s, B0_s)
 
             n = min(5, Au_s.shape[0])
@@ -230,60 +270,137 @@ def train(cfg: TrainConfig) -> None:
 
             # update D (with clipping)
             for _ in range(d_num):
-                Au = next(it_a).to(
-                    device=device, dtype=torch.float32, non_blocking=use_cuda
-                )
-                B0 = next(it_b).to(
-                    device=device, dtype=torch.float32, non_blocking=use_cuda
-                )
-
                 opt_d.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    outs = model(Au, B0)
-                d_losses = compute_d_losses(
-                    Au=Au,
-                    B0=B0,
-                    A0=outs.A0,
-                    Bu=outs.Bu,
-                    d_ax=model.d_ax,
-                    d_be=model.d_be,
-                )
-                d_losses.loss_D.backward()
+                d_acc = None
+                for s in train_sizes:
+                    Au = next(it_a[s]).to(
+                        device=device, dtype=torch.float32, non_blocking=use_cuda
+                    )
+                    B0 = next(it_b[s]).to(
+                        device=device, dtype=torch.float32, non_blocking=use_cuda
+                    )
+                    # Don't update generator BN running stats during critic steps.
+                    with _bn_momentum(model.splitter, 0.0), _bn_momentum(
+                        model.joiner, 0.0
+                    ), torch.no_grad():
+                        outs = model(Au, B0)
+                    d_losses_s = compute_d_losses(
+                        Au=Au,
+                        B0=B0,
+                        A0=outs.A0,
+                        Bu=outs.Bu,
+                        d_ax=model.d_ax,
+                        d_be=model.d_be,
+                    )
+                    (d_losses_s.loss_D / float(len(train_sizes))).backward()
+                    d_losses_s_det = type(d_losses_s)(
+                        Ax_Bx=d_losses_s.Ax_Bx.detach(),
+                        Be_Ae=d_losses_s.Be_Ae.detach(),
+                        loss_D=d_losses_s.loss_D.detach(),
+                    )
+                    if d_acc is None:
+                        d_acc = d_losses_s_det
+                    else:
+                        d_acc = type(d_acc)(
+                            Ax_Bx=d_acc.Ax_Bx + d_losses_s_det.Ax_Bx,
+                            Be_Ae=d_acc.Be_Ae + d_losses_s_det.Be_Ae,
+                            loss_D=d_acc.loss_D + d_losses_s_det.loss_D,
+                        )
                 opt_d.step()
                 clip_params_(model.d_ax, cfg.critic_clip)
                 clip_params_(model.d_be, cfg.critic_clip)
-                last_d = d_losses
+                if d_acc is not None:
+                    scale = float(len(train_sizes))
+                    last_d = type(d_acc)(
+                        Ax_Bx=d_acc.Ax_Bx / scale,
+                        Be_Ae=d_acc.Be_Ae / scale,
+                        loss_D=d_acc.loss_D / scale,
+                    )
 
             # update G
-            Au = next(it_a).to(
-                device=device, dtype=torch.float32, non_blocking=use_cuda
-            )
-            B0 = next(it_b).to(
-                device=device, dtype=torch.float32, non_blocking=use_cuda
-            )
-
             _set_requires_grad(model.d_ax, False)
             _set_requires_grad(model.d_be, False)
             try:
                 opt_g.zero_grad(set_to_none=True)
-                outs = model(Au, B0)
-                g_losses = compute_g_losses(
-                    Au=Au,
-                    B0=B0,
-                    A0=outs.A0,
-                    Bu=outs.Bu,
-                    Au_hat=outs.Au_hat,
-                    B0_hat=outs.B0_hat,
-                    e=outs.e,
-                    d_ax=model.d_ax,
-                    d_be=model.d_be,
-                    splitter=model.splitter,
-                    joiner=model.joiner,
-                    weight_decay=cfg.weight_decay,
-                )
-                g_losses.loss_G.backward()
+                g_acc = None
+                for s in train_sizes:
+                    Au = next(it_a[s]).to(
+                        device=device, dtype=torch.float32, non_blocking=use_cuda
+                    )
+                    B0 = next(it_b[s]).to(
+                        device=device, dtype=torch.float32, non_blocking=use_cuda
+                    )
+
+                    outs = model(Au, B0)
+                    g_losses_s = compute_g_losses(
+                        Au=Au,
+                        B0=B0,
+                        A0=outs.A0,
+                        Bu=outs.Bu,
+                        Au_hat=outs.Au_hat,
+                        B0_hat=outs.B0_hat,
+                        e=outs.e,
+                        d_ax=model.d_ax,
+                        d_be=model.d_be,
+                        splitter=model.splitter,
+                        joiner=model.joiner,
+                        weight_decay=0.0,  # apply once below for multi-res
+                    )
+                    (g_losses_s.loss_G_nodecay / float(len(train_sizes))).backward()
+                    g_losses_s_det = type(g_losses_s)(
+                        e=g_losses_s.e.detach(),
+                        cycle_Ax=g_losses_s.cycle_Ax.detach(),
+                        cycle_Be=g_losses_s.cycle_Be.detach(),
+                        Bx=g_losses_s.Bx.detach(),
+                        Ae=g_losses_s.Ae.detach(),
+                        parallelogram=g_losses_s.parallelogram.detach(),
+                        loss_G_nodecay=g_losses_s.loss_G_nodecay.detach(),
+                        loss_G_decay=g_losses_s.loss_G_decay.detach(),
+                        loss_G=g_losses_s.loss_G.detach(),
+                    )
+                    if g_acc is None:
+                        g_acc = g_losses_s_det
+                    else:
+                        g_acc = type(g_acc)(
+                            e=g_acc.e + g_losses_s_det.e,
+                            cycle_Ax=g_acc.cycle_Ax + g_losses_s_det.cycle_Ax,
+                            cycle_Be=g_acc.cycle_Be + g_losses_s_det.cycle_Be,
+                            Bx=g_acc.Bx + g_losses_s_det.Bx,
+                            Ae=g_acc.Ae + g_losses_s_det.Ae,
+                            parallelogram=g_acc.parallelogram + g_losses_s_det.parallelogram,
+                            loss_G_nodecay=g_acc.loss_G_nodecay + g_losses_s_det.loss_G_nodecay,
+                            loss_G_decay=g_acc.loss_G_decay + g_losses_s_det.loss_G_decay,
+                            loss_G=g_acc.loss_G + g_losses_s_det.loss_G,
+                        )
+
+                # Apply weight decay once on the full parameter set.
+                if cfg.weight_decay > 0:
+                    from genegan.losses import generator_weight_decay
+
+                    decay = generator_weight_decay(
+                        splitter=model.splitter,
+                        joiner=model.joiner,
+                        weight_decay=cfg.weight_decay,
+                        img_size=None,
+                    )
+                    decay.backward()
+                else:
+                    decay = torch.zeros((), device=device)
+
                 opt_g.step()
-                last_g = g_losses
+                if g_acc is not None:
+                    scale = float(len(train_sizes))
+                    last_g = type(g_acc)(
+                        e=g_acc.e / scale,
+                        cycle_Ax=g_acc.cycle_Ax / scale,
+                        cycle_Be=g_acc.cycle_Be / scale,
+                        Bx=g_acc.Bx / scale,
+                        Ae=g_acc.Ae / scale,
+                        parallelogram=g_acc.parallelogram / scale,
+                        loss_G_nodecay=g_acc.loss_G_nodecay / scale,
+                        loss_G_decay=decay.detach(),
+                        loss_G=(g_acc.loss_G_nodecay / scale) + decay.detach(),
+                    )
             finally:
                 _set_requires_grad(model.d_ax, True)
                 _set_requires_grad(model.d_be, True)

@@ -16,6 +16,40 @@ def ensure_dir(path: str | Path) -> Path:
     return p
 
 
+def point_latest_checkpoint(latest_path: str | Path, target_path: str | Path) -> None:
+    """
+    Make `latest_path` point to `target_path` without duplicating checkpoint bytes.
+
+    We prefer a symlink (works well on Linux). If symlinks are not supported, we
+    fall back to a regular copy.
+    """
+    latest = Path(latest_path)
+    target = Path(target_path)
+    latest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use relative link when possible (keeps directories movable).
+    try:
+        rel = target.relative_to(latest.parent)
+    except ValueError:
+        rel = target
+
+    tmp = latest.with_suffix(latest.suffix + ".tmp")
+    if tmp.exists() or tmp.is_symlink():
+        tmp.unlink()
+
+    try:
+        tmp.symlink_to(rel)
+        tmp.replace(latest)
+        return
+    except OSError:
+        # Fall back to a real file copy.
+        if latest.exists() or latest.is_symlink():
+            latest.unlink()
+        import shutil
+
+        shutil.copy2(str(target), str(latest))
+
+
 def tensor_to_uint8_hwc(image: torch.Tensor) -> np.ndarray:
     if image.ndim != 3 or image.shape[0] != 3:
         raise ValueError(f"Expected [3,H,W] tensor, got {tuple(image.shape)}")
@@ -73,10 +107,21 @@ def load_checkpoint(
     map_location: str | torch.device | None = None,
 ) -> dict[str, Any]:
     ckpt = torch.load(str(path), map_location=map_location)
-    splitter.load_state_dict(ckpt["G_splitter"])
-    joiner.load_state_dict(ckpt["G_joiner"])
-    d_ax.load_state_dict(ckpt["D_Ax"])
-    d_be.load_state_dict(ckpt["D_Be"])
+
+    splitter.load_state_dict(ckpt["G_splitter"], strict=False)
+
+    joiner_sd = ckpt["G_joiner"]
+    if "to_rgb.weight" in joiner_sd:
+        # Current multi-res joiner.
+        joiner.load_state_dict(joiner_sd, strict=False)
+    else:
+        raise RuntimeError(
+            "Checkpoint joiner format is not compatible with the current model architecture. "
+            "Please retrain or use the code version that produced this checkpoint."
+        )
+
+    d_ax.load_state_dict(ckpt["D_Ax"], strict=False)
+    d_be.load_state_dict(ckpt["D_Be"], strict=False)
     if opt_g is not None and "opt_G" in ckpt:
         opt_g.load_state_dict(ckpt["opt_G"])
     if opt_d is not None and "opt_D" in ckpt:
@@ -91,4 +136,3 @@ def dump_json(path: str | Path, obj: Any) -> None:
         obj = asdict(obj)
     with p.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
-
